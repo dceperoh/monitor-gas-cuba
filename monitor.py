@@ -2,6 +2,8 @@ import os
 import re
 import json
 import time
+from datetime import datetime, timezone
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -18,11 +20,11 @@ GIST_ID = os.getenv("GIST_ID")
 GIST_TOKEN = os.getenv("GIST_TOKEN")
 GIST_FILENAME = "estado_monitor_gas.json"
 
-# Palabras clave (en minúsculas)
+# Palabras clave
 PALABRAS_SIN_STOCK = ["sin existencias", "agotado", "out of stock", "no disponible"]
 PALABRAS_CON_STOCK = ["disponible", "añadir al carrito", "añadir a la cesta", "in stock"]
 
-# Headers que imitan a un navegador real
+# Headers de navegador real
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -31,7 +33,6 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
     "DNT": "1",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
@@ -126,31 +127,89 @@ def enviar_telegram(mensaje):
 
 
 # ============================================================
-# SCRAPING (mejorado con múltiples estrategias)
+# SCRAPING CON RESOLUCIÓN DE CHALLENGE
 # ============================================================
+def descargar_html_real(url):
+    """
+    Hace una petición, detecta si hay un challenge de cookie JS,
+    extrae la cookie y vuelve a pedir con ella.
+    Devuelve el HTML real o None.
+    """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    print(f"🌐 Petición 1 → {url}")
+    try:
+        r = session.get(url, timeout=30, allow_redirects=True)
+    except Exception as e:
+        print(f"❌ Error en petición 1: {e}")
+        return None
+
+    print(f"   Status: {r.status_code} | Tamaño: {len(r.text)} | Server: {r.headers.get('Server')}")
+
+    # ¿Es un challenge de cookie?
+    if "document.cookie" in r.text and len(r.text) < 5000:
+        print("🔐 Challenge de cookie detectado. Extrayendo cookie...")
+
+        # Buscar: document.cookie = 'nombre=valor; ...'
+        matches = re.findall(
+            r"document\.cookie\s*=\s*['\"]([^'\"]+)['\"]",
+            r.text
+        )
+        if not matches:
+            print("❌ No se pudo extraer la cookie del challenge")
+            return None
+
+        for cookie_string in matches:
+            # cookie_string ejemplo: "dhd2=39e416...; max-age=86400; path=/; domain=goniogas.com"
+            partes = [p.strip() for p in cookie_string.split(";")]
+            if not partes:
+                continue
+            nombre_valor = partes[0]
+            if "=" not in nombre_valor:
+                continue
+            nombre, valor = nombre_valor.split("=", 1)
+            nombre = nombre.strip()
+            valor = valor.strip()
+            print(f"🍪 Cookie extraída: {nombre}={valor}")
+
+            # Asignar la cookie al dominio correcto
+            session.cookies.set(nombre, valor, domain="goniogas.com", path="/")
+
+        # Esperar un poco como haría un navegador
+        time.sleep(3)
+
+        print(f"🌐 Petición 2 → {url} (con cookie)")
+        try:
+            r2 = session.get(url, timeout=30, allow_redirects=True)
+        except Exception as e:
+            print(f"❌ Error en petición 2: {e}")
+            return None
+
+        print(f"   Status: {r2.status_code} | Tamaño: {len(r2.text)} | Server: {r2.headers.get('Server')}")
+
+        # ¿Sigue siendo challenge?
+        if "document.cookie" in r2.text and len(r2.text) < 5000:
+            print("❌ Segundo challenge detectado. No se pudo resolver.")
+            return None
+
+        return r2.text
+
+    # No era challenge, devolvemos lo que tenemos
+    return r.text
+
+
 def verificar_disponibilidad():
     """Devuelve (estado, descripcion, cantidad)."""
-    for intento in range(3):
-        try:
-            r = requests.get(URL_PRODUCTO, headers=HEADERS, timeout=30)
-            print(f"🌐 Status: {r.status_code} | Tamaño: {len(r.text)} bytes | Server: {r.headers.get('Server')}")
-            if r.status_code == 200:
-                break
-        except Exception as e:
-            print(f"⚠️ Intento {intento+1}/3 falló: {e}")
-            time.sleep(3)
-    else:
-        return "error", "No se pudo conectar tras 3 intentos", None
+    html = descargar_html_real(URL_PRODUCTO)
+    if not html:
+        return "error", "No se pudo descargar HTML", None
 
-    html = r.text
     soup = BeautifulSoup(html, "html.parser")
 
-    # ----- ESTRATEGIA 1: buscar <p class="stock ..."> -----
-    stock_el = soup.find("p", class_="stock")
-    if not stock_el:
-        stock_el = soup.find(class_="stock")
+    # ----- ESTRATEGIA 1: <p class="stock ..."> -----
+    stock_el = soup.find("p", class_="stock") or soup.find(class_="stock")
 
-    texto_stock = ""
     if stock_el:
         texto_stock = stock_el.get_text(" ", strip=True)
         clases = " ".join(stock_el.get("class", []))
@@ -158,51 +217,57 @@ def verificar_disponibilidad():
         print(f"   Texto: '{texto_stock}'")
         print(f"   Clases: '{clases}'")
 
-        # out-of-stock detectado por clase
         if "out-of-stock" in clases:
             return "sin_stock", "Sin existencias", 0
         if "in-stock" in clases:
-            # Extraer cantidad
             numeros = re.findall(r"\d+", texto_stock)
             cantidad = int(numeros[0]) if numeros else None
             return "con_stock", texto_stock, cantidad
 
-    # ----- ESTRATEGIA 2: por texto -----
-    texto_lower = texto_stock.lower()
-    for p in PALABRAS_SIN_STOCK:
-        if p in texto_lower:
-            return "sin_stock", "Sin existencias", 0
+    # ----- ESTRATEGIA 2: por texto en el bloque stock -----
+    if stock_el:
+        texto_lower = stock_el.get_text(" ", strip=True).lower()
+        for p in PALABRAS_SIN_STOCK:
+            if p in texto_lower:
+                return "sin_stock", "Sin existencias", 0
+        m = re.search(r"(\d+)\s*disponible", texto_lower)
+        if m:
+            return "con_stock", texto_lower, int(m.group(1))
 
-    # Buscar "N disponible(s)" en el bloque de stock
-    m = re.search(r"(\d+)\s*disponible", texto_lower)
-    if m:
-        return "con_stock", texto_stock, int(m.group(1))
-
-    # ----- ESTRATEGIA 3: buscar en todo el HTML el <p class="stock"> -----
-    m = re.search(r'<p[^>]*class="[^"]*stock[^"]*out-of-stock[^"]*"[^>]*>([^<]*)</p>', html, re.IGNORECASE)
+    # ----- ESTRATEGIA 3: por regex en el HTML -----
+    m = re.search(
+        r'<p[^>]*class="[^"]*stock[^"]*out-of-stock[^"]*"[^>]*>([^<]*)</p>',
+        html, re.IGNORECASE
+    )
     if m:
         return "sin_stock", m.group(1).strip(), 0
 
-    m = re.search(r'<p[^>]*class="[^"]*stock[^"]*in-stock[^"]*"[^>]*>([^<]*)</p>', html, re.IGNORECASE)
+    m = re.search(
+        r'<p[^>]*class="[^"]*stock[^"]*in-stock[^"]*"[^>]*>([^<]*)</p>',
+        html, re.IGNORECASE
+    )
     if m:
         texto = m.group(1).strip()
         nums = re.findall(r"\d+", texto)
         cantidad = int(nums[0]) if nums else None
         return "con_stock", texto, cantidad
 
-    # ----- ESTRATEGIA 4: fallback al texto completo -----
+    # ----- ESTRATEGIA 4: texto global -----
     texto_plano = soup.get_text(" ", strip=True).lower()
     if "sin existencias" in texto_plano:
-        return "sin_stock", "Sin existencias (detectado en texto global)", 0
+        return "sin_stock", "Sin existencias (texto global)", 0
 
-    # Buscar "N disponibles" en toda la página
     m = re.search(r"(\d+)\s*disponibles?", texto_plano)
     if m:
         return "con_stock", f"{m.group(1)} disponibles", int(m.group(1))
 
-    # Si vemos "añadir al carrito/añadir a la cesta" cerca del producto, asumimos stock
     if "añadir al carrito" in texto_plano or "añadir a la cesta" in texto_plano:
         return "con_stock", "Botón de compra presente", None
+
+    # Diagnóstico: guardar HTML para inspección
+    with open("debug_html.html", "w", encoding="utf-8") as f:
+        f.write(html)
+    print("💾 HTML guardado en debug_html.html para inspección")
 
     return "desconocido", "No se pudo determinar el estado", None
 
@@ -214,7 +279,7 @@ def formatear_mensaje(cantidad, descripcion):
     if cantidad and cantidad > 0:
         cantidad_txt = f"<b>{cantidad}</b> cilindro(s)"
     elif cantidad == 0:
-        cantidad_txt = "<b>0</b> (sin stock)"
+        cantidad_txt = "<b>0</b>"
     else:
         cantidad_txt = "(cantidad no especificada)"
 
@@ -250,8 +315,7 @@ def main():
 
     ahora = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
-    # Notificar SIEMPRE que haya stock (no solo al cambiar)
-    # pero evitar spam: notificar si hay stock Y (cambió de estado O pasó >30 min)
+    # Notificar si hay stock (cambio o recordatorio cada 30 min)
     notificar = False
     motivo = ""
 
@@ -260,27 +324,22 @@ def main():
             notificar = True
             motivo = "¡Cambio a disponible!"
         else:
-            # Ya estaba disponible; notificar de nuevo solo si pasaron >30 min
-            # desde la última notificación
             ultima = estado_anterior.get("ultima_notificacion")
             if ultima:
                 try:
-                    from datetime import datetime, timezone
                     t_ultima = datetime.strptime(ultima, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
                     t_ahora = datetime.now(timezone.utc)
                     minutos = (t_ahora - t_ultima).total_seconds() / 60
                     if minutos >= 30:
                         notificar = True
-                        motivo = f"Recordatorio: sigue disponible ({int(minutos)} min desde última alerta)"
-                except Exception as e:
-                    print(f"⚠️ No se pudo calcular tiempo: {e}")
+                        motivo = f"Recordatorio: sigue disponible ({int(minutos)} min)"
+                except Exception:
                     notificar = True
-                    motivo = "Re-notificando (no se pudo verificar tiempo)"
+                    motivo = "Re-notificando"
             else:
                 notificar = True
                 motivo = "Primera detección con stock"
 
-    # Guardar estado
     estado_nuevo = {
         "disponibilidad": nuevo_estado,
         "cantidad": cantidad,
@@ -290,14 +349,13 @@ def main():
     }
     guardar_estado_gist(estado_nuevo)
 
-    # Enviar notificación
     if notificar:
         print(f"🎉 {motivo} → Enviando a Telegram...")
         enviar_telegram(formatear_mensaje(cantidad, descripcion))
     elif nuevo_estado == "sin_stock":
         print("😴 Sin existencias. Nada que hacer.")
     elif nuevo_estado == "con_stock":
-        print("ℹ️ Sigue disponible. Ya se notificó hace <30 min. Sin spam.")
+        print("ℹ️ Sigue disponible. Ya se notificó hace <30 min.")
     else:
         print(f"⚠️ Estado desconocido: {descripcion}")
 
