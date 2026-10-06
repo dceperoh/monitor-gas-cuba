@@ -21,7 +21,7 @@ GIST_TOKEN = os.getenv("GIST_TOKEN")
 GIST_FILENAME = "estado_monitor_gas.json"
 
 # Palabras clave
-PALABRAS_SIN_STOCK = ["esto_no_existe_jamas"]
+PALABRAS_SIN_STOCK = ["sin existencias", "agotado", "out of stock", "no disponible"]
 PALABRAS_CON_STOCK = ["disponible", "añadir al carrito", "añadir a la cesta", "in stock"]
 
 # Headers de navegador real
