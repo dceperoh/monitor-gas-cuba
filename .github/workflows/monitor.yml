@@ -28,5 +28,3 @@ jobs:
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
         run: python monitor.py
-      - name: Diagnóstico (temporal)
-        run: python debug.py
