@@ -1,22 +1,25 @@
 name: Monitor Disponibilidad Gas
 
 on:
-  workflow_dispatch:      # Permite ejecución manual y desde cron-job.org
+  workflow_dispatch:
   schedule:
-    - cron: '*/10 * * * *'  # Cada 10 minutos (UTC) - respaldo
+    - cron: '*/10 * * * *'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   verificar:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout repositorio
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configurar Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
       - name: Instalar dependencias
         run: pip install -r requirements.txt
