@@ -330,7 +330,7 @@ def main():
                     t_ultima = datetime.strptime(ultima, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
                     t_ahora = datetime.now(timezone.utc)
                     minutos = (t_ahora - t_ultima).total_seconds() / 60
-                    if minutos >= 30:
+                    if minutos >= 10:
                         notificar = True
                         motivo = f"Recordatorio: sigue disponible ({int(minutos)} min)"
                 except Exception:
