@@ -11,7 +11,14 @@ from bs4 import BeautifulSoup
 # CONFIGURACIÓN
 # ============================================================
 URL_PRODUCTO = "https://goniogas.com/producto/cilindro-de-gas-de-10kg/"
-URL_COMPRA = "https://goniogas.com/checkout/?add-to-cart=108"
+
+# Enlaces directos al carrito para cada variación
+URL_COMPRA_RECARGA = (
+    "https://goniogas.com/checkout/?add-to-cart=108&variation_id=7551&quantity=1"
+)
+URL_COMPRA_COMPLETO = (
+    "https://goniogas.com/checkout/?add-to-cart=108&variation_id=7552&quantity=1"
+)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -20,11 +27,6 @@ GIST_ID = os.getenv("GIST_ID")
 GIST_TOKEN = os.getenv("GIST_TOKEN")
 GIST_FILENAME = "estado_monitor_gas.json"
 
-# Palabras clave
-PALABRAS_SIN_STOCK = ["sin existencias", "agotado", "out of stock", "no disponible"]
-PALABRAS_CON_STOCK = ["disponible", "añadir al carrito", "añadir a la cesta", "in stock"]
-
-# Headers de navegador real
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -49,7 +51,7 @@ HEADERS = {
 # ============================================================
 def leer_estado_gist():
     if not GIST_ID or not GIST_TOKEN:
-        return {"disponibilidad": "desconocido", "cantidad": None,
+        return {"disponibilidad": "desconocido", "variaciones": {},
                 "ultima_verificacion": None, "ultima_notificacion": None}
     url = f"https://api.github.com/gists/{GIST_ID}"
     headers = {
@@ -65,7 +67,7 @@ def leer_estado_gist():
         return estado
     except Exception as e:
         print(f"❌ Error leyendo Gist: {e}")
-        return {"disponibilidad": "desconocido", "cantidad": None,
+        return {"disponibilidad": "desconocido", "variaciones": {},
                 "ultima_verificacion": None, "ultima_notificacion": None}
 
 
@@ -111,7 +113,7 @@ def enviar_telegram(mensaje):
                 "chat_id": cid,
                 "text": mensaje,
                 "parse_mode": "HTML",
-                "disable_web_page_preview": False,
+                "disable_web_page_preview": True,
             }
             resp = requests.post(url, json=payload, timeout=15)
             if resp.status_code == 200:
@@ -130,14 +132,8 @@ def enviar_telegram(mensaje):
 # SCRAPING CON RESOLUCIÓN DE CHALLENGE
 # ============================================================
 def descargar_html_real(url):
-    """
-    Hace una petición, detecta si hay un challenge de cookie JS,
-    extrae la cookie y vuelve a pedir con ella.
-    Devuelve el HTML real o None.
-    """
     session = requests.Session()
     session.headers.update(HEADERS)
-
     print(f"🌐 Petición 1 → {url}")
     try:
         r = session.get(url, timeout=30, allow_redirects=True)
@@ -147,21 +143,13 @@ def descargar_html_real(url):
 
     print(f"   Status: {r.status_code} | Tamaño: {len(r.text)} | Server: {r.headers.get('Server')}")
 
-    # ¿Es un challenge de cookie?
     if "document.cookie" in r.text and len(r.text) < 5000:
         print("🔐 Challenge de cookie detectado. Extrayendo cookie...")
-
-        # Buscar: document.cookie = 'nombre=valor; ...'
-        matches = re.findall(
-            r"document\.cookie\s*=\s*['\"]([^'\"]+)['\"]",
-            r.text
-        )
+        matches = re.findall(r"document\.cookie\s*=\s*['\"]([^'\"]+)['\"]", r.text)
         if not matches:
             print("❌ No se pudo extraer la cookie del challenge")
             return None
-
         for cookie_string in matches:
-            # cookie_string ejemplo: "dhd2=39e416...; max-age=86400; path=/; domain=goniogas.com"
             partes = [p.strip() for p in cookie_string.split(";")]
             if not partes:
                 continue
@@ -169,130 +157,151 @@ def descargar_html_real(url):
             if "=" not in nombre_valor:
                 continue
             nombre, valor = nombre_valor.split("=", 1)
-            nombre = nombre.strip()
-            valor = valor.strip()
-            print(f"🍪 Cookie extraída: {nombre}={valor}")
-
-            # Asignar la cookie al dominio correcto
-            session.cookies.set(nombre, valor, domain="goniogas.com", path="/")
-
-        # Esperar un poco como haría un navegador
+            print(f"🍪 Cookie extraída: {nombre.strip()}={valor.strip()}")
+            session.cookies.set(nombre.strip(), valor.strip(), domain="goniogas.com", path="/")
         time.sleep(3)
-
         print(f"🌐 Petición 2 → {url} (con cookie)")
         try:
             r2 = session.get(url, timeout=30, allow_redirects=True)
         except Exception as e:
             print(f"❌ Error en petición 2: {e}")
             return None
-
         print(f"   Status: {r2.status_code} | Tamaño: {len(r2.text)} | Server: {r2.headers.get('Server')}")
-
-        # ¿Sigue siendo challenge?
         if "document.cookie" in r2.text and len(r2.text) < 5000:
             print("❌ Segundo challenge detectado. No se pudo resolver.")
             return None
-
         return r2.text
 
-    # No era challenge, devolvemos lo que tenemos
     return r.text
 
 
-def verificar_disponibilidad():
-    """Devuelve (estado, descripcion, cantidad)."""
-    html = descargar_html_real(URL_PRODUCTO)
-    if not html:
-        return "error", "No se pudo descargar HTML", None
-
+# ============================================================
+# EXTRACCIÓN DEL JSON DE VARIACIONES
+# ============================================================
+def extraer_variaciones(html):
+    """
+    Extrae el JSON de data-product_variations que WooCommerce
+    embebe en el HTML del producto. Devuelve una lista de dicts.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
-    # ----- ESTRATEGIA 1: <p class="stock ..."> -----
-    stock_el = soup.find("p", class_="stock") or soup.find(class_="stock")
+    # Buscar el form de variaciones
+    form = soup.find("form", class_="variations_form")
+    if not form:
+        print("⚠️ No se encontró el form de variaciones")
+        return []
 
-    if stock_el:
-        texto_stock = stock_el.get_text(" ", strip=True)
-        clases = " ".join(stock_el.get("class", []))
-        print(f"🎯 <p class='stock'> encontrado:")
-        print(f"   Texto: '{texto_stock}'")
-        print(f"   Clases: '{clases}'")
+    data_json = form.get("data-product_variations")
+    if not data_json:
+        print("⚠️ No se encontró data-product_variations")
+        return []
 
-        if "out-of-stock" in clases:
-            return "sin_stock", "Sin existencias", 0
-        if "in-stock" in clases:
-            numeros = re.findall(r"\d+", texto_stock)
-            cantidad = int(numeros[0]) if numeros else None
-            return "con_stock", texto_stock, cantidad
+    try:
+        variaciones = json.loads(data_json)
+        print(f"✅ Se encontraron {len(variaciones)} variaciones")
+        return variaciones
+    except json.JSONDecodeError as e:
+        print(f"❌ Error parseando JSON de variaciones: {e}")
+        return []
 
-    # ----- ESTRATEGIA 2: por texto en el bloque stock -----
-    if stock_el:
-        texto_lower = stock_el.get_text(" ", strip=True).lower()
-        for p in PALABRAS_SIN_STOCK:
-            if p in texto_lower:
-                return "sin_stock", "Sin existencias", 0
-        m = re.search(r"(\d+)\s*disponible", texto_lower)
-        if m:
-            return "con_stock", texto_lower, int(m.group(1))
 
-    # ----- ESTRATEGIA 3: por regex en el HTML -----
-    m = re.search(
-        r'<p[^>]*class="[^"]*stock[^"]*out-of-stock[^"]*"[^>]*>([^<]*)</p>',
-        html, re.IGNORECASE
-    )
-    if m:
-        return "sin_stock", m.group(1).strip(), 0
+def analizar_variaciones(variaciones):
+    """
+    Analiza cada variación y devuelve un dict:
+    {
+      "Recarga": {"id": 7551, "precio": 42, "stock": True/False, "cantidad": N},
+      "Cilindro completo": {"id": 7552, "precio": 70, "stock": True/False, "cantidad": N}
+    }
+    """
+    resultado = {}
+    for v in variaciones:
+        attrs = v.get("attributes", {})
+        nombre_variacion = attrs.get("attribute_tipo-de-compra", "Desconocida")
+        var_id = v.get("variation_id")
+        precio = v.get("display_price", 0)
+        is_in_stock = v.get("is_in_stock", False)
+        max_qty = v.get("max_qty")
 
-    m = re.search(
-        r'<p[^>]*class="[^"]*stock[^"]*in-stock[^"]*"[^>]*>([^<]*)</p>',
-        html, re.IGNORECASE
-    )
-    if m:
-        texto = m.group(1).strip()
-        nums = re.findall(r"\d+", texto)
-        cantidad = int(nums[0]) if nums else None
-        return "con_stock", texto, cantidad
+        # Intentar extraer cantidad de disponibilidad del availability_html
+        avail_html = v.get("availability_html", "")
+        cantidad = None
+        if avail_html:
+            # Buscar patrones como "5 disponibles" o "5 in stock"
+            match = re.search(r"(\d+)\s*(?:disponible|in stock|units?)", avail_html, re.IGNORECASE)
+            if match:
+                cantidad = int(match.group(1))
+            elif "in-stock" in avail_html.lower():
+                cantidad = None  # Disponible pero sin número
 
-    # ----- ESTRATEGIA 4: texto global -----
-    texto_plano = soup.get_text(" ", strip=True).lower()
-    if "sin existencias" in texto_plano:
-        return "sin_stock", "Sin existencias (texto global)", 0
+        resultado[nombre_variacion] = {
+            "id": var_id,
+            "precio": precio,
+            "stock": bool(is_in_stock),
+            "cantidad": cantidad,
+            "max_qty": max_qty,
+        }
+        estado = "✅ CON STOCK" if is_in_stock else "❌ SIN STOCK"
+        print(f"   - {nombre_variacion} (ID {var_id}, {precio}€): {estado}")
 
-    m = re.search(r"(\d+)\s*disponibles?", texto_plano)
-    if m:
-        return "con_stock", f"{m.group(1)} disponibles", int(m.group(1))
-
-    if "añadir al carrito" in texto_plano or "añadir a la cesta" in texto_plano:
-        return "con_stock", "Botón de compra presente", None
-
-    # Diagnóstico: guardar HTML para inspección
-    with open("debug_html.html", "w", encoding="utf-8") as f:
-        f.write(html)
-    print("💾 HTML guardado en debug_html.html para inspección")
-
-    return "desconocido", "No se pudo determinar el estado", None
+    return resultado
 
 
 # ============================================================
-# MENSAJE
+# MENSAJES
 # ============================================================
-def formatear_mensaje(cantidad, descripcion):
-    if cantidad and cantidad > 0:
-        cantidad_txt = f"<b>{cantidad}</b> cilindro(s)"
-    elif cantidad == 0:
-        cantidad_txt = "<b>0</b>"
+def construir_mensaje(variaciones_data):
+    """
+    Construye el mensaje de Telegram con las variaciones
+    que tienen stock y sus enlaces de compra.
+    """
+    recarga = variaciones_data.get("Recarga", {})
+    completo = variaciones_data.get("Cilindro completo", {})
+
+    # Estados
+    recarga_stock = recarga.get("stock", False)
+    completo_stock = completo.get("stock", False)
+
+    if not recarga_stock and not completo_stock:
+        return None  # Sin stock, no enviar
+
+    # Encabezado
+    msg = "🚨 <b>¡CILINDROS DE GAS DISPONIBLES!</b> 🚨\n\n"
+    msg += "<b>📦 Estado actual:</b>\n"
+
+    # Recarga
+    if recarga_stock:
+        cant_txt = f" ({recarga['cantidad']} disp.)" if recarga.get("cantidad") else ""
+        msg += f"✅ <b>Recarga</b> (42€){cant_txt}\n"
     else:
-        cantidad_txt = "(cantidad no especificada)"
+        msg += f"❌ <b>Recarga</b> (42€): Sin stock\n"
 
-    return (
-        f"🚨 <b>¡CILINDROS DE GAS DISPONIBLES!</b> 🚨\n\n"
-        f"📦 <b>Disponibilidad:</b> {cantidad_txt}\n"
-        f"📝 <b>Detalle:</b> {descripcion}\n"
-        f"💰 <b>Precio:</b> 25,00 €\n"
-        f"📍 <b>Punto:</b> La Coronela – Calle 222 e/23 y 25 – La Lisa\n\n"
-        f"🛒 <b>COMPRAR AHORA:</b>\n"
-        f'<a href="{URL_COMPRA}">➡️ Añadir al carrito y pagar</a>\n\n'
-        f"⏰ ¡Corre, que vuelan!"
-    )
+    # Cilindro completo
+    if completo_stock:
+        cant_txt = f" ({completo['cantidad']} disp.)" if completo.get("cantidad") else ""
+        msg += f"✅ <b>Cilindro completo</b> (70€){cant_txt}\n"
+    else:
+        msg += f"❌ <b>Cilindro completo</b> (70€): Sin stock\n"
+
+    msg += "\n"
+
+    # Enlaces de compra (solo si hay stock)
+    if recarga_stock:
+        msg += (
+            "🛒 <b>COMPRAR RECARGA (42€):</b>\n"
+            f'<a href="{URL_COMPRA_RECARGA}">➡️ Añadir Recarga al carrito</a>\n\n'
+        )
+
+    if completo_stock:
+        msg += (
+            "🛒 <b>COMPRAR CILINDRO COMPLETO (70€):</b>\n"
+            f'<a href="{URL_COMPRA_COMPLETO}">➡️ Añadir Cilindro completo al carrito</a>\n\n'
+        )
+
+    msg += "📍 <b>Punto:</b> La Coronela – Calle 222 e/23 y 25 – La Lisa\n"
+    msg += "💰 <b>Precio:</b> 42€ (Recarga) / 70€ (Cilindro completo)\n"
+    msg += "⏰ ¡Corre, que vuelan!"
+
+    return msg
 
 
 # ============================================================
@@ -300,39 +309,65 @@ def formatear_mensaje(cantidad, descripcion):
 # ============================================================
 def main():
     print("=" * 60)
-    print("🔍 MONITOR DE DISPONIBILIDAD - GONIO GAS")
+    print("🔍 MONITOR DE DISPONIBILIDAD - GONIO GAS (v2 VARIACIONES)")
     print(f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
     print("=" * 60)
 
+    # 1. Leer estado anterior
     estado_anterior = leer_estado_gist()
-    estado_previo = estado_anterior.get("disponibilidad", "desconocido")
-    print(f"📊 Estado anterior: {estado_previo}")
+    variaciones_previas = estado_anterior.get("variaciones", {})
+    print(f"📊 Estado anterior: {variaciones_previas}")
 
-    nuevo_estado, descripcion, cantidad = verificar_disponibilidad()
-    print(f"📊 Estado nuevo: {nuevo_estado}")
-    print(f"📝 Descripción: {descripcion}")
-    print(f"🔢 Cantidad: {cantidad}")
+    # 2. Descargar HTML
+    html = descargar_html_real(URL_PRODUCTO)
+    if not html:
+        print("❌ No se pudo descargar el HTML")
+        return 1
+
+    # 3. Extraer y analizar variaciones
+    variaciones = extraer_variaciones(html)
+    if not variaciones:
+        # Fallback: comprobar el <p class="stock"> general
+        soup = BeautifulSoup(html, "html.parser")
+        stock_el = soup.find("p", class_="stock")
+        if stock_el:
+            texto = stock_el.get_text(" ", strip=True)
+            clases = " ".join(stock_el.get("class", []))
+            print(f"⚠️ Fallback: texto de stock general = '{texto}' | clases='{clases}'")
+        return 1
+
+    data_actual = analizar_variaciones(variaciones)
+
+    # 4. Determinar si hay stock de alguna
+    recarga_stock = data_actual.get("Recarga", {}).get("stock", False)
+    completo_stock = data_actual.get("Cilindro completo", {}).get("stock", False)
+    hay_stock = recarga_stock or completo_stock
+
+    # 5. Leer estados anteriores
+    recarga_previo = variaciones_previas.get("Recarga", {}).get("stock", False)
+    completo_previo = variaciones_previas.get("Cilindro completo", {}).get("stock", False)
 
     ahora = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
-    # Notificar si hay stock (cambio o recordatorio cada 30 min)
+    # 6. Decidir si notificar
     notificar = False
     motivo = ""
 
-    if nuevo_estado == "con_stock":
-        if estado_previo != "con_stock":
+    if hay_stock:
+        # ¿Cambió alguno de sin_stock a con_stock?
+        if (recarga_stock and not recarga_previo) or (completo_stock and not completo_previo):
             notificar = True
             motivo = "¡Cambio a disponible!"
         else:
+            # Recordatorio cada 10 min
             ultima = estado_anterior.get("ultima_notificacion")
             if ultima:
                 try:
                     t_ultima = datetime.strptime(ultima, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
-                    t_ahora = datetime.now(timezone.utc)
-                    minutos = (t_ahora - t_ultima).total_seconds() / 60
+                    minutos = (datetime.now(timezone.utc) - t_ultima).total_seconds() / 60
                     if minutos >= 10:
                         notificar = True
-                        motivo = f"Recordatorio: sigue disponible ({int(minutos)} min)"
+                        motivo = f"Recordatorio ({int(minutos)} min)"
                 except Exception:
                     notificar = True
                     motivo = "Re-notificando"
@@ -340,24 +375,30 @@ def main():
                 notificar = True
                 motivo = "Primera detección con stock"
 
+    # 7. Guardar estado
     estado_nuevo = {
-        "disponibilidad": nuevo_estado,
-        "cantidad": cantidad,
-        "descripcion": descripcion,
+        "disponibilidad": "con_stock" if hay_stock else "sin_stock",
+        "variaciones": {
+            "Recarga": data_actual.get("Recarga", {}),
+            "Cilindro completo": data_actual.get("Cilindro completo", {}),
+        },
         "ultima_verificacion": ahora,
         "ultima_notificacion": ahora if notificar else estado_anterior.get("ultima_notificacion"),
     }
     guardar_estado_gist(estado_nuevo)
 
+    # 8. Enviar Telegram
     if notificar:
-        print(f"🎉 {motivo} → Enviando a Telegram...")
-        enviar_telegram(formatear_mensaje(cantidad, descripcion))
-    elif nuevo_estado == "sin_stock":
-        print("😴 Sin existencias. Nada que hacer.")
-    elif nuevo_estado == "con_stock":
-        print("ℹ️ Sigue disponible. Ya se notificó hace <30 min.")
+        mensaje = construir_mensaje(data_actual)
+        if mensaje:
+            print(f"🎉 {motivo} → Enviando a Telegram...")
+            enviar_telegram(mensaje)
+        else:
+            print("⚠️ Se detectó stock pero no se pudo construir el mensaje")
+    elif hay_stock:
+        print("ℹ️ Sigue disponible. Ya se notificó hace <10 min.")
     else:
-        print(f"⚠️ Estado desconocido: {descripcion}")
+        print("😴 Sin existencias en ninguna variación. Nada que hacer.")
 
     print("=" * 60)
     return 0
